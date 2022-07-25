@@ -38,9 +38,11 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+//import java.net.HttpURLConnection;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLDecoder;
+import java.security.cert.X509Certificate;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -53,6 +55,12 @@ import java.util.regex.Pattern;
 
 import androidx.work.Worker;
 import androidx.work.WorkerParameters;
+
+import javax.net.ssl.HostnameVerifier;
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
 
 import io.flutter.FlutterInjector;
 import io.flutter.embedding.engine.FlutterEngine;
@@ -69,17 +77,19 @@ public class DownloadWorker extends Worker implements MethodChannel.MethodCallHa
     public static final String ARG_IS_RESUME = "is_resume";
     public static final String ARG_SHOW_NOTIFICATION = "show_notification";
     public static final String ARG_OPEN_FILE_FROM_NOTIFICATION = "open_file_from_notification";
+    public static final String ARG_NOTIFICATION_TITLE = "notification_title";
     public static final String ARG_CALLBACK_HANDLE = "callback_handle";
     public static final String ARG_DEBUG = "debug";
+    public static final String ARG_STEP = "step";
     public static final String ARG_SAVE_IN_PUBLIC_STORAGE = "save_in_public_storage";
+    public static final String ARG_IGNORESSL = "ignoreSsl";
 
     private static final String TAG = DownloadWorker.class.getSimpleName();
     private static final int BUFFER_SIZE = 4096;
     private static final String CHANNEL_ID = "FLUTTER_DOWNLOADER_NOTIFICATION";
-    private static final int STEP_UPDATE = 5;
 
     private static final AtomicBoolean isolateStarted = new AtomicBoolean(false);
-    private static final ArrayDeque<List> isolateQueue = new ArrayDeque<>();
+    private static final ArrayDeque<List<Object>> isolateQueue = new ArrayDeque<>();
     private static FlutterEngine backgroundFlutterEngine;
 
     private final Pattern charsetPattern = Pattern.compile("(?i)\\bcharset=\\s*\"?([^\\s;\"]*)");
@@ -92,22 +102,18 @@ public class DownloadWorker extends Worker implements MethodChannel.MethodCallHa
     private boolean showNotification;
     private boolean clickToOpenDownloadedFile;
     private boolean debug;
+    private boolean ignoreSsl;
     private int lastProgress = 0;
     private int primaryId;
     private String msgStarted, msgInProgress, msgCanceled, msgFailed, msgPaused, msgComplete;
     private long lastCallUpdateNotification = 0;
+    private int step;
     private boolean saveInPublicStorage;
 
-    public DownloadWorker(@NonNull final Context context,
-                          @NonNull WorkerParameters params) {
+    public DownloadWorker(@NonNull final Context context, @NonNull WorkerParameters params) {
         super(context, params);
 
-        new Handler(context.getMainLooper()).post(new Runnable() {
-            @Override
-            public void run() {
-                startBackgroundIsolate(context);
-            }
-        });
+        new Handler(context.getMainLooper()).post(() -> startBackgroundIsolate(context));
     }
 
     private void startBackgroundIsolate(Context context) {
@@ -138,7 +144,7 @@ public class DownloadWorker extends Worker implements MethodChannel.MethodCallHa
     }
 
     @Override
-    public void onMethodCall(MethodCall call, MethodChannel.Result result) {
+    public void onMethodCall(MethodCall call, @NonNull MethodChannel.Result result) {
         if (call.method.equals("didInitializeDispatcher")) {
             synchronized (isolateStarted) {
                 while (!isolateQueue.isEmpty()) {
@@ -160,10 +166,11 @@ public class DownloadWorker extends Worker implements MethodChannel.MethodCallHa
 
         String url = getInputData().getString(ARG_URL);
         String filename = getInputData().getString(ARG_FILE_NAME);
+        String notificationTitle = getInputData().getString(ARG_NOTIFICATION_TITLE);
 
         DownloadTask task = taskDao.loadTask(getId().toString());
         if (task != null && task.status == DownloadStatus.ENQUEUED) {
-            updateNotification(context, filename == null ? url : filename, DownloadStatus.CANCELED, -1, null, true);
+            updateNotification(context, filename == null ? url : filename, DownloadStatus.CANCELED, -1, null, true, notificationTitle);
             taskDao.updateTask(getId().toString(), DownloadStatus.CANCELED, lastProgress);
         }
     }
@@ -181,6 +188,8 @@ public class DownloadWorker extends Worker implements MethodChannel.MethodCallHa
         String headers = getInputData().getString(ARG_HEADERS);
         boolean isResume = getInputData().getBoolean(ARG_IS_RESUME, false);
         debug = getInputData().getBoolean(ARG_DEBUG, false);
+        step = getInputData().getInt(ARG_STEP, 10);
+        ignoreSsl = getInputData().getBoolean(ARG_IGNORESSL, false);
 
         Resources res = getApplicationContext().getResources();
         msgStarted = res.getString(R.string.flutter_downloader_notification_started);
@@ -201,13 +210,14 @@ public class DownloadWorker extends Worker implements MethodChannel.MethodCallHa
 
         showNotification = getInputData().getBoolean(ARG_SHOW_NOTIFICATION, false);
         clickToOpenDownloadedFile = getInputData().getBoolean(ARG_OPEN_FILE_FROM_NOTIFICATION, false);
+        String notificationTitle = getInputData().getString(ARG_NOTIFICATION_TITLE);
         saveInPublicStorage = getInputData().getBoolean(ARG_SAVE_IN_PUBLIC_STORAGE, false);
 
         primaryId = task.primaryId;
 
         setupNotification(context);
 
-        updateNotification(context, filename == null ? url : filename, DownloadStatus.RUNNING, task.progress, null, false);
+        updateNotification(context, filename == null ? url : filename, DownloadStatus.RUNNING, task.progress, null, false, notificationTitle);
         taskDao.updateTask(getId().toString(), DownloadStatus.RUNNING, task.progress);
 
         //automatic resume for partial files. (if the workmanager unexpectedly quited in background)
@@ -215,17 +225,17 @@ public class DownloadWorker extends Worker implements MethodChannel.MethodCallHa
         File partialFile = new File(saveFilePath);
         if (partialFile.exists()) {
             isResume = true;
-            log("exists file for "+ filename + "automatic resuming...");
+            log("exists file for " + filename + "automatic resuming...");
         }
 
         try {
-            downloadFile(context, url, savedDir, filename, headers, isResume);
+            downloadFile(context, url, savedDir, filename, notificationTitle, headers, isResume);
             cleanUp();
             dbHelper = null;
             taskDao = null;
             return Result.success();
         } catch (Exception e) {
-            updateNotification(context, filename == null ? url : filename, DownloadStatus.FAILED, -1, null, true);
+            updateNotification(context, filename == null ? url : filename, DownloadStatus.FAILED, -1, null, true, notificationTitle);
             taskDao.updateTask(getId().toString(), DownloadStatus.FAILED, lastProgress);
             e.printStackTrace();
             dbHelper = null;
@@ -239,7 +249,7 @@ public class DownloadWorker extends Worker implements MethodChannel.MethodCallHa
             log("Headers = " + headers);
             try {
                 JSONObject json = new JSONObject(headers);
-                for (Iterator<String> it = json.keys(); it.hasNext(); ) {
+                for (Iterator<String> it = json.keys(); it.hasNext();) {
                     String key = it.next();
                     conn.setRequestProperty(key, json.getString(key));
                 }
@@ -262,7 +272,7 @@ public class DownloadWorker extends Worker implements MethodChannel.MethodCallHa
         return downloadedBytes;
     }
 
-    private void downloadFile(Context context, String fileURL, String savedDir, String filename, String headers, boolean isResume) throws IOException {
+    private void downloadFile(Context context, String fileURL, String savedDir, String filename, String notificationTitle, String headers, boolean isResume) throws IOException {
         String url = fileURL;
         URL resourceUrl, base, next;
         Map<String, Integer> visited;
@@ -290,12 +300,24 @@ public class DownloadWorker extends Worker implements MethodChannel.MethodCallHa
                     throw new IOException("Stuck in redirect loop");
 
                 resourceUrl = new URL(url);
-                log("Open connection to " + url);
-                httpConn = (HttpURLConnection) resourceUrl.openConnection();
 
+                if (ignoreSsl) {
+                    trustAllHosts();
+                    if (resourceUrl.getProtocol().toLowerCase().equals("https")) {
+                        HttpsURLConnection https = (HttpsURLConnection) resourceUrl.openConnection();
+                        https.setHostnameVerifier(DO_NOT_VERIFY);
+                        httpConn = https;
+                    } else {
+                        httpConn = (HttpURLConnection) resourceUrl.openConnection();
+                    }
+                } else {
+                    httpConn = (HttpsURLConnection) resourceUrl.openConnection();
+                }
+
+                log("Open connection to " + url);
                 httpConn.setConnectTimeout(60000);
                 httpConn.setReadTimeout(60000);
-                httpConn.setInstanceFollowRedirects(false);   // Make the logic below easier to detect redirections
+                httpConn.setInstanceFollowRedirects(false); // Make the logic below easier to detect redirections
                 httpConn.setRequestProperty("User-Agent", "Mozilla/5.0...");
 
                 // setup request headers if it is set
@@ -316,7 +338,7 @@ public class DownloadWorker extends Worker implements MethodChannel.MethodCallHa
                         location = httpConn.getHeaderField("Location");
                         log("Location = " + location);
                         base = new URL(url);
-                        next = new URL(base, location);  // Deal with relative URLs
+                        next = new URL(base, location); // Deal with relative URLs
                         url = next.toExternalForm();
                         log("New url: " + url);
                         continue;
@@ -362,7 +384,6 @@ public class DownloadWorker extends Worker implements MethodChannel.MethodCallHa
                 // opens input stream from the HTTP connection
                 inputStream = httpConn.getInputStream();
 
-
                 String savedFilePath;
                 // opens an output stream to save into file
                 // there are two case:
@@ -396,7 +417,7 @@ public class DownloadWorker extends Worker implements MethodChannel.MethodCallHa
                     int progress = (int) ((count * 100) / (contentLength + downloadedBytes));
                     outputStream.write(buffer, 0, bytesRead);
 
-                    if ((lastProgress == 0 || progress > lastProgress + STEP_UPDATE || progress == 100)
+                    if ((lastProgress == 0 || progress > (lastProgress + step) || progress == 100)
                             && progress != lastProgress) {
                         lastProgress = progress;
 
@@ -406,7 +427,7 @@ public class DownloadWorker extends Worker implements MethodChannel.MethodCallHa
                         // a new bunch of data fetched and a notification sent
                         taskDao.updateTask(getId().toString(), DownloadStatus.RUNNING, progress);
 
-                        updateNotification(context, filename, DownloadStatus.RUNNING, progress, null, false);
+                        updateNotification(context, filename, DownloadStatus.RUNNING, progress, null, false, notificationTitle);
                     }
                 }
 
@@ -436,19 +457,19 @@ public class DownloadWorker extends Worker implements MethodChannel.MethodCallHa
                     }
                 }
                 taskDao.updateTask(getId().toString(), status, progress);
-                updateNotification(context, filename, status, progress, pendingIntent, true);
+                updateNotification(context, filename, status, progress, pendingIntent, true, notificationTitle);
 
                 log(isStopped() ? "Download canceled" : "File downloaded");
             } else {
                 DownloadTask task = taskDao.loadTask(getId().toString());
                 int status = isStopped() ? (task.resumable ? DownloadStatus.PAUSED : DownloadStatus.CANCELED) : DownloadStatus.FAILED;
                 taskDao.updateTask(getId().toString(), status, lastProgress);
-                updateNotification(context, filename == null ? fileURL : filename, status, -1, null, true);
+                updateNotification(context, filename == null ? fileURL : filename, status, -1, null, true, notificationTitle);
                 log(isStopped() ? "Download canceled" : "Server replied HTTP code: " + responseCode);
             }
         } catch (IOException e) {
             taskDao.updateTask(getId().toString(), DownloadStatus.FAILED, lastProgress);
-            updateNotification(context, filename == null ? fileURL : filename, DownloadStatus.FAILED, -1, null, true);
+            updateNotification(context, filename == null ? fileURL : filename, DownloadStatus.FAILED, -1, null, true, notificationTitle);
             e.printStackTrace();
         } finally {
             if (outputStream != null) {
@@ -517,11 +538,10 @@ public class DownloadWorker extends Worker implements MethodChannel.MethodCallHa
     private String getMediaStoreEntryPathApi29(Uri uri) {
         try (Cursor cursor = getApplicationContext().getContentResolver().query(
                 uri,
-                new String[]{MediaStore.Files.FileColumns.DATA},
+                new String[] { MediaStore.Files.FileColumns.DATA },
                 null,
                 null,
-                null
-        )) {
+                null)) {
             if (cursor == null)
                 return null;
             if (!cursor.moveToFirst())
@@ -537,8 +557,8 @@ public class DownloadWorker extends Worker implements MethodChannel.MethodCallHa
     void scanFilePath(String path, String mimeType, CallbackUri callback) {
         MediaScannerConnection.scanFile(
                 getApplicationContext(),
-                new String[]{path},
-                new String[]{mimeType},
+                new String[] { path },
+                new String[] { mimeType },
                 (path1, uri) -> callback.invoke(uri));
     }
 
@@ -574,10 +594,7 @@ public class DownloadWorker extends Worker implements MethodChannel.MethodCallHa
         if (!showNotification) return;
         // Make a channel if necessary
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            // Create the NotificationChannel, but only on API 26+ because
-            // the NotificationChannel class is new and not in the support library
-
-
+            // Create the NotificationChannel
             Resources res = getApplicationContext().getResources();
             String channelName = res.getString(R.string.flutter_downloader_notification_channel_name);
             String channelDescription = res.getString(R.string.flutter_downloader_notification_channel_description);
@@ -592,14 +609,14 @@ public class DownloadWorker extends Worker implements MethodChannel.MethodCallHa
         }
     }
 
-    private void updateNotification(Context context, String title, int status, int progress, PendingIntent intent, boolean finalize) {
+    private void updateNotification(Context context, String title, int status, int progress, PendingIntent intent, boolean finalize, String notificationTitle) {
         sendUpdateProcessEvent(status, progress);
 
         // Show the notification
         if (showNotification) {
             // Create the notification
             NotificationCompat.Builder builder = new NotificationCompat.Builder(context, CHANNEL_ID).
-                    setContentTitle(title)
+                    setContentTitle(notificationTitle == null ? title : notificationTitle)
                     .setContentIntent(intent)
                     .setOnlyAlertOnce(true)
                     .setAutoCancel(true)
@@ -792,5 +809,38 @@ public class DownloadWorker extends Worker implements MethodChannel.MethodCallHa
 
     public interface CallbackUri {
         void invoke(Uri uri);
+    }
+
+    final static HostnameVerifier DO_NOT_VERIFY = (hostname, session) -> true;
+
+    /**
+     * Trust every server - dont check for any certificate
+     */
+    private static void trustAllHosts() {
+        final String TAG = "trustAllHosts";
+        // Create a trust manager that does not validate certificate chains
+        TrustManager[] trustManagers = new TrustManager[] { new X509TrustManager() {
+
+            public java.security.cert.X509Certificate[] getAcceptedIssuers() {
+                return new java.security.cert.X509Certificate[] {};
+            }
+
+            public void checkClientTrusted(X509Certificate[] chain, String authType) {
+                Log.i(TAG, "checkClientTrusted");
+            }
+
+            public void checkServerTrusted(X509Certificate[] chain, String authType) {
+                Log.i(TAG, "checkServerTrusted");
+            }
+        } };
+
+        // Install the all-trusting trust manager
+        try {
+            SSLContext sslContent = SSLContext.getInstance("TLS");
+            sslContent.init(null, trustManagers, new java.security.SecureRandom());
+            HttpsURLConnection.setDefaultSSLSocketFactory(sslContent.getSocketFactory());
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
     }
 }
