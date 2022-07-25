@@ -27,6 +27,7 @@ import androidx.work.NetworkType;
 import androidx.work.OneTimeWorkRequest;
 import androidx.work.WorkManager;
 import androidx.work.WorkRequest;
+import androidx.work.OutOfQuotaPolicy;
 
 import io.flutter.embedding.engine.plugins.FlutterPlugin;
 import io.flutter.plugin.common.BinaryMessenger;
@@ -113,6 +114,7 @@ public class FlutterDownloaderPlugin implements MethodCallHandler, FlutterPlugin
                                      boolean showNotification, boolean openFileFromNotification, String notificationTitle,
                                      boolean isResume, boolean requiresStorageNotLow, boolean saveInPublicStorage) {
         WorkRequest request = new OneTimeWorkRequest.Builder(DownloadWorker.class)
+                .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
                 .setConstraints(new Constraints.Builder()
                         .setRequiresStorageNotLow(requiresStorageNotLow)
                         .setRequiredNetworkType(NetworkType.CONNECTED)
